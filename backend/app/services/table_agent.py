@@ -170,82 +170,84 @@ def parse_llm_json(llm_output_str):
     except json.JSONDecodeError:
         return None
 
-def generate_new_table_details(df_columns, intents, subdomain):
+import json
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+# Assume 'llm' and 'parse_llm_json' are defined elsewhere
+
+def generate_new_table_details(df, intents, subdomain):
     """
-    Uses an LLM to generate a table name and a detailed column mapping,
-    with a retry mechanism for up to 2 retries.
+    Uses a single LLM call to generate a table name and a detailed column mapping,
+    informed by a data sample. Includes a retry mechanism.
     """
-    print("\nStep 3: Asking LLM to generate a new table schema...")
+    print("\nStep 3: Asking LLM to generate a complete table schema...")
+    
+    # --- Improvement 1: Create a data sample ---
+    # Get the first 3 rows of the DataFrame as a string for context
+    data_sample = df.head(3).to_string()
+    df_columns = df.columns.tolist()
+
     intent_string = ", ".join(intents) if isinstance(intents, list) else intents
-    table_name_prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are an expert database designer. Your task is to generate a new SQL table name based on a list of column headers from a dataframe.
+
+    # --- Improvement 2: A single, combined prompt ---
+    combined_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert database designer. Your task is to create a complete SQL table schema based on a dataframe's headers and a sample of its data.
 
         File Intents: {intent_string}
         Dataframe Headers: {columns}
         Subdomain: {subdomain}
 
-        ### Naming Guidelines:
-        1. Use **snake_case**.
-        2. The name must be **short but descriptive** and match the **domain/intent**.
-        3. Capture key context such as:
-        - **Time/frequency**: annual, monthly, quarterly, provisional, calendar_wise, financial_year_wise, etc.
-        - **Scope**: city_wise, state_wise, sector_wise, etc.
-        - **Units/indicators**: crore, usd, index, value, growth_rate, data.
-        4. Avoid generic words like "table", "dataset", or "file". Instead, use **economic/statistical terms**.
-        5. Use abbreviations where common (e.g., gdp, cpi, wpi, iip, bdi).
-        6. Ensure it **resembles existing patterns** like:
+        Data Sample (first 3 rows):
+        {data_sample}
+
+        ### Instructions:
+        1.  Generate a concise, descriptive SQL **table name** in `snake_case`. Follow the naming patterns provided.
+        2.  For each dataframe header, generate a corresponding SQL **column name** (in `snake_case`) and infer the most appropriate SQL **data type** (TEXT, REAL, INTEGER).
+        3.  **Crucially, use the Data Sample to determine the correct data type.** For example, if a 'month' column contains text like 'March', its type is TEXT, not INTEGER.
+        4.  Return a **single JSON object** containing both the 'table_name' and the 'columns' list.
+
+        ### Example Naming Patterns for 'table_name':
         - annual_estimate_gdp_crore
         - city_wise_housing_price_indices
-        - consumer_price_index_cpi_for_agricultural_and_rural_labourers
         - exchange_rate_lcy_usd
-        - iip_monthly_data
         - whole_sale_price_index_wpi_calendar_wise
 
-        ### Output Format:
-        Return only a JSON object:
+        ### Required JSON Output Format:
         {{
-        "table_name": "<generated_table_name>"
+            "table_name": "<generated_table_name>",
+            "columns": [
+                {{"df_col": "product_name", "sql_col": "product_name", "sql_type": "TEXT"}},
+                {{"df_col": "item_price", "sql_col": "price", "sql_type": "REAL"}},
+                {{"df_col": "transaction_month", "sql_col": "transaction_month", "sql_type": "TEXT"}}
+            ]
         }}
         """),
-            ("human", "Generate the JSON for my new table.")
-        ])
+        ("human", "Generate the complete JSON schema for my table.")
+    ])
 
-    column_prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are an expert database designer. Your task is to create a schema for a new SQL table based on a list of column headers from a dataframe.
-
-        File Intents: {intent_string}
-        Dataframe Headers: {columns}
-
-        Guidelines:
-        1.  For each dataframe header, generate a corresponding SQL column name (also in `snake_case`) and infer the most appropriate SQL data type (TEXT, REAL, INTEGER).
-        2.  Return a JSON object with key: 'columns'.
-            - 'columns': A LIST of objects, where each object has three keys: 'df_col' (the original dataframe header), 'sql_col' (the generated SQL column name), and 'sql_type' (the SQL data type).
-            
-        Example Response:
-        {{
-        "columns": [
-            {{"df_col": "product_name", "sql_col": "product_name", "sql_type": "TEXT"}},
-            {{"df_col": "item_price", "sql_col": "price", "sql_type": "REAL"}}
-        ]
-        }}
-        """),
-                ("human", "Generate the JSON for my new table.")
-            ])
-
-    table_name_chain = table_name_prompt | llm | StrOutputParser()
-    column_chain = column_prompt | llm | StrOutputParser()
+    # Create a single chain for the combined task
+    chain = combined_prompt | llm | StrOutputParser()
     
     max_retries = 2
     for attempt in range(max_retries + 1):
         try:
             print(f"LLM schema generation: Attempt {attempt + 1}/{max_retries + 1}...")
-            table_name_response_str = table_name_chain.invoke({"columns": ", ".join(df_columns), "intent_string": intent_string, "subdomain": subdomain})
             
-            table_name_result = parse_llm_json(table_name_response_str)
+            response_str = chain.invoke({
+                "columns": ", ".join(df_columns),
+                "intent_string": intent_string,
+                "subdomain": subdomain,
+                "data_sample": data_sample
+            })
+            
+            result = parse_llm_json(response_str)
 
-            print(f"LLM generated schema successfully: {table_name_result}")
-            if table_name_result:
-                break
+            # Validate that the result is a dictionary and both required keys are present
+            if isinstance(result, dict) and 'table_name' in result and 'columns' in result:
+                print(f"LLM generated schema successfully: {result}")
+                return result
+            else:
+                raise KeyError("LLM response was not a valid dictionary or was missing 'table_name' or 'columns'.")
 
         except (json.JSONDecodeError, KeyError) as e:
             print(f"Error on attempt {attempt + 1}: Could not parse LLM response. Error: {e}")
@@ -253,29 +255,7 @@ def generate_new_table_details(df_columns, intents, subdomain):
                 print("Retrying...")
             else:
                 print("All retry attempts have failed.")
-
-    max_retries = 2
-    for attempt in range(max_retries + 1):
-        try:
-            print(f"LLM schema generation: Attempt {attempt + 1}/{max_retries + 1}...")
-            column_response_str = column_chain.invoke({"columns": ", ".join(df_columns), "intent_string": intent_string})
-            
-            column_result = parse_llm_json(column_response_str)
-            print(f"LLM generated schema successfully: {column_result}")
-            
-            if column_result:
-                break
-
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"Error on attempt {attempt + 1}: Could not parse LLM response. Error: {e}")
-            if attempt < max_retries:
-                print("Retrying...")
-            else:
-                print("All retry attempts have failed.")
-
-    if table_name_result and column_result:
-        result = {"table_name": table_name_result['table_name'], "columns": column_result['columns']}
-        return result
+                return None
     
     return None
 
@@ -383,6 +363,9 @@ def ingest_markdown_table(md_table: str, file_name: str, file_size: int, intents
         print("Error occurred:", e)
 
     file_selector_prompt = None
+    if df is None:
+        raise Exception("Normalization failed. Aborting.")
+    
     target_table = get_matching_table_name(
         schema=schema,
         df_columns=df.columns.tolist(),
@@ -395,7 +378,7 @@ def ingest_markdown_table(md_table: str, file_name: str, file_size: int, intents
         table_schema = get_table_schema(conn, target_table)
         column_map = generate_existing_table_column_map(table_schema, df.columns.tolist())
     else:
-        schema_details = generate_new_table_details(df.columns.tolist(), intents, subdomain)
+        schema_details = generate_new_table_details(df, intents, subdomain)
         if not schema_details:
             print("Could not generate a valid new table schema. Aborting.")
             conn.close()

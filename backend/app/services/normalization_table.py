@@ -1,288 +1,178 @@
 import pandas as pd
-import numpy as np
-import re
-import json
-from collections import defaultdict
-from typing import List, Dict, Any, Optional
+import os
+from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# LangChain and Pydantic imports for structured LLM output
+# LangChain and Pydantic imports
 from langchain_core.prompts import PromptTemplate
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.globals import set_llm_cache
+from langchain_community.cache import InMemoryCache
+from langchain.output_parsers import OutputFixingParser
 
-class ColumnDimension(BaseModel):
-    """Defines new dimension columns to be added based on header information."""
-    region: Optional[str] = Field(None, description="Geographical region, e.g., 'Urban', 'Rural', 'Combined'")
-    state: Optional[str] = Field(None, description="State or province, e.g., 'Delhi'")
-    month: Optional[str] = Field(None, description="Month name, e.g., 'June'")
-    year: Optional[int] = Field(None, description="Year, e.g., 2024")
-    status: Optional[str] = Field(None, description="Status of the data, e.g., 'Final', 'Prov.' (Provisional)")
+# --- Pydantic Models (Unchanged) ---
+class NormalizedRow(BaseModel):
+    item_description: str = Field(..., description="The primary identifier for the row.")
+    region: Optional[str] = Field(None, description="Geographical sub-region.")
+    state: Optional[str] = Field(None, description="State or Union Territory.")
+    month: Optional[str] = Field(None, description="Month name.")
+    year: Optional[int] = Field(None, description="Year.")
+    status: Optional[str] = Field(None, description="Status of the data if available.")
+    metrics: Dict[str, Optional[float]] = Field(..., description="A dictionary of all metric names (snake_case) to their float values.")
 
+    @field_validator('*', mode='before')
+    def clean_nan_and_empty_str(cls, v):
+        if isinstance(v, str) and (v.strip() in ['--', '-', 'NA', 'N.A.'] or not v.strip()):
+            return None
+        return v
 
-class ColumnMapping(BaseModel):
-    """Defines the transformation for a single original column."""
-    new_column: str = Field(..., description="The new, clean name for the column metric, e.g., 'Index', 'Value', 'Weights'.")
-    dimensions: Optional[ColumnDimension] = Field(None, description="Additional dimensions extracted from the header.")
+class NormalizedTable(BaseModel):
+    data: List[NormalizedRow] = Field(..., description="A list of all the normalized data rows from the table.")
 
-class TransformationPlan(BaseModel):
-    """The complete transformation plan, mapping all original columns to their new structure."""
-    plan: Dict[str, ColumnMapping] = Field(..., description="A dictionary where keys are original column names and values are their transformation mappings.")
+    @field_validator('data', mode='before')
+    def filter_empty_rows(cls, v):
+        """
+        Catches and removes any empty dictionary artifacts from the LLM's list output
+        before the main validation runs.
+        """
+        if isinstance(v, list):
+            # Filter out any list items that are empty dictionaries
+            return [row for row in v if row]
+        return v
 
-def parse_markdown_table(md_str: str) -> pd.DataFrame:
-    """
-    Parses a markdown table string into a Pandas DataFrame.
-    This function is designed to handle tables with multiple header lines,
-    intelligently combining them to handle merged/spanned headers. It filters
-    out non-semantic header rows (e.g., '(1)', '(2)').
+# --- The core prompt and parser can be defined globally ---
+PARSER = PydanticOutputParser(pydantic_object=NormalizedTable)
 
-    Args:
-        md_str: A string containing the markdown table.
+PROMPT_TEMPLATE = PromptTemplate(
+    template="""
+    You are an expert data ETL specialist. Your goal is to convert a messy markdown table into a clean, 'tidy' JSON format.
 
-    Returns:
-        A Pandas DataFrame representing the initial, potentially untidy, table.
+    **Golden Rule: Your response MUST be a valid JSON object and nothing else.** Do not wrap it in markdown backticks. Do not add explanations. Your output should begin with `{{"data":...}}`.
+
+    **Instructions:**
+    1.  **Analyze the entire table:** Pay close attention to nested column headers (e.g., 'Rural', 'Urban', 'Combined') and multi-line headers.
+    2.  **Unpivot Data:** The input table is "wide". Make it "long". For each state, create a separate JSON object for each combination of region (Rural, Urban, Combined) and month (June, July).
+    3.  **Extract Dimensions:**
+        - `region`: Extract from the top-level headers ('Rural', 'Urban', 'Combined').
+        - `month`, `year`, `status`: Extract from the second-level, multi-line headers (e.g., 'June 24 <br> Index <br> (Final)' implies month='June', year=2024, status='Final').
+    4.  **Infer Metrics:** The primary metrics are 'weights' and 'index'. Create a `metrics` dictionary with these `snake_case` keys.
+    5.  **Handle Identifiers:** The state/UT name is both the `item_description` and the `state`. For 'All India', set the `state` field to null but keep `item_description` as 'All India'.
+    6.  **Data Cleaning:** Convert placeholders like '--', '-', or empty cells to `null`.
+
+    **Example for a Complex Table:**
+    *Input Markdown:*
+    ```
+    | State | Rural | | Urban | |
+    |---|---|---|---|---|
+    | | Weights | June 24 Index (Final) | Weights | June 24 Index (Final) |
+    |---|---|---|---|---|
+    | Karnataka | 5.09 | 195.9 | 6.81 | 197.3 |
+    | Delhi | -- | 170.5 | 5.64 | 168.7 |
+    ```
     
-    Raises:
-        ValueError: If the markdown table format is invalid.
-    """
-    lines = [line.strip() for line in md_str.strip().split('\n') if line.strip()]
-    
-    separator_index = -1
-    for i, line in enumerate(lines):
-        if re.match(r'^[|: -]+$', line):
-            separator_index = i
-            break
-            
-    if separator_index == -1:
-        raise ValueError("Markdown table separator '---|---' not found.")
+    *Your Expected JSON Output:*
+    ```json
+    {{
+      "data": [
+        {{
+          "item_description": "Karnataka", "region": "Rural", "state": "Karnataka",
+          "month": "June", "year": 2024, "status": "Final",
+          "metrics": {{"weights": 5.09, "index": 195.9}}
+        }},
+        {{
+          "item_description": "Karnataka", "region": "Urban", "state": "Karnataka",
+          "month": "June", "year": 2024, "status": "Final",
+          "metrics": {{"weights": 6.81, "index": 197.3}}
+        }},
+        {{
+          "item_description": "Delhi", "region": "Rural", "state": "Delhi",
+          "month": "June", "year": 2024, "status": "Final",
+          "metrics": {{"weights": null, "index": 170.5}}
+        }},
+        {{
+          "item_description": "Delhi", "region": "Urban", "state": "Delhi",
+          "month": "June", "year": 2024, "status": "Final",
+          "metrics": {{"weights": 5.64, "index": 168.7}}
+        }}
+      ]
+    }}
+    ```
 
-    header_lines = lines[:separator_index]
-    data_lines = lines[separator_index + 1:]
-
-    # A more robust way to parse cells, avoiding empty strings from start/end pipes
-    header_rows = [[cell.strip() for cell in line.split('|')[1:-1]] for line in header_lines]
-    data = [[cell.strip() for cell in line.split('|')[1:-1]] for line in data_lines]
-    
-    # Filter out non-semantic header rows (e.g., those containing only '(1)', '(2)', etc.)
-    semantic_header_rows = []
-    for row in header_rows:
-        is_semantic = any(not re.fullmatch(r'\(\d+\)', cell) for cell in row if cell)
-        if is_semantic:
-            semantic_header_rows.append(row)
-    header_rows = semantic_header_rows
-
-    columns = []
-    if not header_rows:
-        raise ValueError("No semantic header rows found in Markdown table.")
-    elif len(header_rows) == 1:
-        columns = header_rows[0]
-    else:
-        # Handle multi-level (merged) headers by combining them
-        num_cols = max(len(row) for row in header_rows)
-        for row in header_rows:
-            if len(row) < num_cols:
-                row.extend([''] * (num_cols - len(row)))
-        
-        # Start with the bottom-most header as the base
-        combined_headers = list(header_rows[-1])
-        
-        # Prepend prefixes from the rows above
-        for i in range(len(header_rows) - 2, -1, -1):
-            prefix_row = header_rows[i]
-            current_prefix = ""
-            for j, cell in enumerate(prefix_row):
-                if cell:
-                    current_prefix = cell
-                # Prepend the prefix if it exists and the current header is not empty
-                if current_prefix and combined_headers[j]:
-                    combined_headers[j] = f"{current_prefix}_{combined_headers[j]}"
-        columns = combined_headers
-
-    if data and len(columns) != len(data[0]):
-         raise ValueError(
-            f"Column count mismatch. Header has {len(columns)} columns, "
-            f"but data row has {len(data[0])} ({data[0]}) cells."
-        )
-
-    df = pd.DataFrame(data, columns=columns)
-    
-    # Replace common non-numeric placeholders with NaN
-    df.replace('--', np.nan, inplace=True)
-
-    # Attempt to convert data to numeric types where possible
-    for col in df.columns:
-        try:
-            df[col] = pd.to_numeric(df[col])
-        except (ValueError, TypeError):
-            pass # If conversion fails, leave the column as is (object type)
-        
-    return df
-
-def normalize_table(df: pd.DataFrame, llm_chain: Any) -> pd.DataFrame:
-    """
-    Normalizes a DataFrame by unpivoting and merging metrics that have different
-    sets of dimensions (e.g., 'Weights' by region and 'Index' by region/month).
-
-    Args:
-        df: The initial DataFrame from `parse_markdown_table`.
-        llm_chain: The LangChain chain that will generate the transformation plan.
-
-    Returns:
-        A tidy Pandas DataFrame.
-    """
-    original_columns = df.columns.tolist()
-    response = llm_chain.invoke({"columns": json.dumps(original_columns)})
-    plan = response.plan
-
-    # Identify identifier columns that don't need to be unpivoted
-    id_vars = [
-        col for col, mapping in plan.items()
-        if not mapping.dimensions or not mapping.dimensions.dict(exclude_none=True)
-    ]
-    
-    # Clean up names of id_vars based on the plan
-    id_rename_map = {col: plan[col].new_column for col in id_vars}
-    df.rename(columns=id_rename_map, inplace=True)
-    final_id_vars = list(id_rename_map.values())
-
-    # Group original columns by their new metric name (e.g., 'Index', 'Weights')
-    metrics_to_process = defaultdict(list)
-    for orig_col, mapping in plan.items():
-        if orig_col not in id_vars:
-            metrics_to_process[mapping.new_column].append(orig_col)
-
-    metric_dfs = {}
-    
-    # Process each metric group separately to handle different dimensionalities
-    for metric_name, orig_cols in metrics_to_process.items():
-        # Melt the dataframe for just the current metric's columns
-        melted_df = df.melt(
-            id_vars=final_id_vars,
-            value_vars=orig_cols,
-            var_name='original_column',
-            value_name=metric_name
-        )
-        melted_df.dropna(subset=[metric_name], inplace=True)
-        if melted_df.empty:
-            continue
-
-        # Create a map of original columns to their dimensions
-        dim_map = {
-            orig_col: plan[orig_col].dimensions.dict(exclude_none=True)
-            for orig_col in orig_cols
-        }
-        
-        # Get all unique dimension keys for this metric group
-        all_dims = set(d for dims in dim_map.values() for d in dims.keys())
-        for dim in all_dims:
-            melted_df[dim] = melted_df['original_column'].apply(
-                lambda x: dim_map.get(x, {}).get(dim)
-            )
-
-        melted_df.drop(columns=['original_column'], inplace=True)
-        
-        # Remove rows where none of the relevant dimensions were populated
-        if all_dims:
-            melted_df.dropna(subset=list(all_dims), how='all', inplace=True)
-        
-        metric_dfs[metric_name] = melted_df
-
-    if not metric_dfs:
-        return df[final_id_vars]
-
-    # Iteratively merge the tidy metric DataFrames, starting with the most granular one
-    try:
-        base_metric = max(metric_dfs.keys(), key=lambda k: metric_dfs[k].shape[1])
-        final_df = metric_dfs.pop(base_metric)
-    except ValueError:
-        return pd.DataFrame() # No metrics to process
-
-    for metric_name, other_df in metric_dfs.items():
-        # Determine common columns to merge on (identifiers + shared dimensions)
-        merge_cols = [col for col in other_df.columns if col in final_df.columns and col != metric_name]
-        
-        final_df = pd.merge(final_df, other_df, on=merge_cols, how='left')
-
-    # Reorder columns for final output
-    dim_cols = sorted([col for col in final_df.columns if col not in final_id_vars and col not in metrics_to_process.keys()])
-    metric_cols = sorted(list(metrics_to_process.keys()))
-    
-    final_cols_order = final_id_vars + dim_cols + metric_cols
-    # Filter to ensure all columns exist in the final DataFrame
-    final_cols_order = [c for c in final_cols_order if c in final_df.columns]
-    
-    return final_df[final_cols_order]
-
-
-def run_normalization(md_str: str) -> pd.DataFrame:
-    """
-    A high-level function that runs the full normalization pipeline.
-
-    Args:
-        md_str: A string containing the markdown table.
-
-    Returns:
-        A final, tidy Pandas DataFrame.
-    """
-    print("--- Starting Normalization ---")
-    
-    # Step 1: Initialize LLM and create the LangChain chain
-    try:
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, convert_system_message_to_human=True)
-    except Exception as e:
-        print("\nERROR: Could not initialize Gemini.")
-        print("Please ensure the GOOGLE_API_KEY environment variable is set correctly.")
-        print(f"Details: {e}")
-        return pd.DataFrame() # Return empty df on error
-
-    parser = PydanticOutputParser(pydantic_object=TransformationPlan)
-    
-    prompt_template = """
-    You are an expert data scientist specializing in tidying economic data tables.
-    Your task is to analyze the column headers of a DataFrame and create a transformation plan to convert it into a tidy format.
-
-    A tidy format has one observation per row, with variables in columns. The headers you receive are sometimes "denormalized," meaning they contain multiple pieces of information. Your job is to extract this information into new dimension columns.
-
-    RULES:
-    - Keep original metric names as final column headers (e.g., 'Index', 'IIP', 'Value', 'Weights'). Do NOT create a generic 'metric' column.
-    - Only add new dimension columns if information is present in the headers. Supported dimensions are: 'region', 'state', 'month', 'year', 'status'.
-    - Identifier columns without extra dimensions (like 'Date', 'Commodity', 'Year', 'Sl. No.', 'Name of the State/UT') should be mapped to themselves without new dimensions.
-    - For status, use 'Final' or 'Prov.' (for Provisional) if present.
-
-    EXAMPLES:
-    - Header 'march_23_index' -> new column 'Index', dimensions: {{'month': 'March', 'year': 2023}}.
-    - Header 'Delhi_IIP' -> new column 'IIP', dimensions: {{'state': 'Delhi'}}.
-    - Header 'Urban_Value' -> new column 'Value', dimensions: {{'region': 'Urban'}}.
-    - Header 'Rural_June 24 Index (Final)' -> new column 'Index', dimensions: {{'region': 'Rural', 'month': 'June', 'year': 2024, 'status': 'Final'}}.
-    - Header 'Combined_Weights' -> new column 'Weights', dimensions: {{'region': 'Combined'}}.
-    - Header 'Year' -> new column 'Year', no extra dimensions.
-
-    Here are the column headers from the table to be transformed:
-    {columns}
+    **Now, process the following markdown table:**
+    {markdown_table}
 
     {format_instructions}
+    """,
+    input_variables=["markdown_table"],
+    partial_variables={"format_instructions": PARSER.get_format_instructions()}
+)
+MODEL_NAME = "gemini-2.5-flash"
+set_llm_cache(InMemoryCache())
+try:
+    llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0, convert_system_message_to_human=True)
+except Exception as e:
+    print(f"\nERROR: Could not initialize Gemini (Model: {MODEL_NAME}). Check your GOOGLE_API_KEY.")
+    print(f"Details: {e}")
+    exit()
+
+def run_normalization(md_str: str) -> Optional[pd.DataFrame]:
     """
+    Takes a single markdown table string and a pre-initialized LLM, returning a DataFrame.
+    Uses an OutputFixingParser for maximum resilience.
+    """
+    print(f"--- Processing a table... ---")
+    
+    try:
+        # 1. The original parser defines the desired output structure.
+        base_parser = PydanticOutputParser(pydantic_object=NormalizedTable)
+        
+        # 2. The OutputFixingParser wraps the original parser.
+        #    If base_parser fails, it intelligently calls the LLM again to fix the output.
+        parser = OutputFixingParser.from_llm(parser=base_parser, llm=llm)
 
-    prompt = PromptTemplate(
-        template=prompt_template,
-        input_variables=["columns"],
-        partial_variables={"format_instructions": parser.get_format_instructions()},
-    )
-    
-    chain = prompt | llm | parser
-    
-    # Step 2: Parse the raw markdown into an initial DataFrame
-    print("1. Parsing markdown table...")
-    initial_df = parse_markdown_table(md_str)
-    print("Initial DataFrame:")
-    print(initial_df)
-    print("\nColumns to normalize:", initial_df.columns.tolist())
-    
-    # Step 3: Use the LLM chain to normalize the DataFrame
-    print("\n2. Calling LLM to generate transformation plan...")
-    normalized_df = normalize_table(initial_df, chain)
-    print("3. Transformation complete.")
-    print(normalized_df.head(70))
-    print("--- Normalization Finished ---")
-    return normalized_df
+        # The chain now uses the new, self-healing parser
+        chain = PROMPT_TEMPLATE | llm | parser
+        
+        structured_result = chain.invoke({"markdown_table": md_str})
 
+        if not structured_result or not structured_result.data:
+            print("Warning: LLM returned no data for this table.")
+            return None
+            
+        data_list = [row.model_dump() for row in structured_result.data]
+        df = pd.json_normalize(data_list)
+        df.columns = df.columns.str.replace('metrics.', '', regex=False)
+        
+        id_cols = ['item_description']
+        dim_cols = [col for col in ['state', 'region', 'year', 'month', 'status'] if col in df.columns]
+        metric_cols = sorted([col for col in df.columns if col not in id_cols and col not in dim_cols])
+        
+        df.dropna(axis=1, how='all', inplace=True)
+        final_cols_order = [c for c in id_cols + dim_cols + metric_cols if c in df.columns]
+        
+        print("--- Table processed successfully. ---")
+        return df[final_cols_order]
+
+    except Exception as e:
+        print(f"\nERROR: LLM call failed or output could not be parsed even after attempting a fix. Details: {e}")
+        return None
+
+def batch_process_tables(md_strings: List[str], llm: ChatGoogleGenerativeAI, max_workers: int = 5) -> List[pd.DataFrame]:
+    """
+    Processes a list of markdown table strings in parallel.
+    """
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit each markdown string to the executor
+        future_to_md = {executor.submit(run_normalization, md_str): md_str for md_str in md_strings}
+        
+        for future in as_completed(future_to_md):
+            try:
+                result_df = future.result()
+                if result_df is not None:
+                    results.append(result_df)
+            except Exception as e:
+                print(f"An exception occurred while processing a table: {e}")
+    return results
