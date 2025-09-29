@@ -159,7 +159,7 @@ def run_normalization(md_str: str) -> Optional[pd.DataFrame]:
         print(f"\nERROR: LLM call failed or output could not be parsed even after attempting a fix. Details: {e}")
         return None
 
-def batch_process_tables(md_strings: List[str], llm: ChatGoogleGenerativeAI, max_workers: int = 5) -> List[pd.DataFrame]:
+def batch_process_tables(md_strings: List[str], max_workers: int = 5) -> List[pd.DataFrame]:
     """
     Processes a list of markdown table strings in parallel.
     """

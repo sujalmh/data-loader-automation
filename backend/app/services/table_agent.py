@@ -1,4 +1,4 @@
-import sqlite3
+import psycopg2
 import pandas as pd
 import io
 import json
@@ -6,7 +6,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_google_genai import GoogleGenerativeAI
-from langchain_core.messages import AIMessage   
+from langchain_core.messages import AIMessage
 from langchain.prompts import PromptTemplate
 from langchain.schema import SystemMessage, HumanMessage
 
@@ -15,92 +15,128 @@ from app.services.normalization_table import run_normalization
 
 from dotenv import load_dotenv
 import os
+import re
+import mdpd
+
+# --- ENVIRONMENT & LLM SETUP ---
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
 llm = GoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=api_key)
 
-DB_PATH = "sql.db" # Use in-memory SQLite database for this example
-
-# --- DATABASE HELPER FUNCTIONS ---
+# --- DATABASE HELPER FUNCTIONS (POSTGRESQL) ---
 
 def get_db_connection():
-    """Establishes a connection to the SQLite database."""
-    return sqlite3.connect(DB_PATH)
+    """Establishes a connection to the PostgreSQL database."""
+    try:
+        conn = psycopg2.connect(
+            dbname=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            host=os.getenv("DB_HOST"),
+            port=os.getenv("DB_PORT")
+        )
+        return conn
+    except psycopg2.OperationalError as e:
+        print(f"❌ Error: Could not connect to PostgreSQL database. Please check your connection settings.")
+        raise e
 
 def get_db_schema(conn):
     """
-    Retrieves the schema of all tables in the database.
+    Retrieves the schema of all tables in the public schema of the database.
     This is crucial context for the LLM.
     """
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-    tables = cursor.fetchall()
     schema_info = "Database Schema:\n"
-    for table_name_tuple in tables:
-        table_name = table_name_tuple[0]
-        schema_info += f"\nTable: {table_name}\n"
-        cursor.execute(f"PRAGMA table_info({table_name});")
-        columns = cursor.fetchall()
-        for col in columns:
-            # col structure: (id, name, type, notnull, default_value, pk)
-            schema_info += f"  - {col[1]} ({col[2]})\n"
-    print("Table:",tables)
+    with conn.cursor() as cursor:
+        # Get all table names from the 'public' schema
+        cursor.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_type = 'BASE TABLE';
+        """)
+        tables = cursor.fetchall()
+
+        if not tables:
+            return "" # Return empty if no tables are found
+
+        for table_name_tuple in tables:
+            table_name = table_name_tuple[0]
+            schema_info += f"\nTable: {table_name}\n"
+
+            # Get column names and types for the current table
+            cursor.execute("""
+                SELECT column_name, data_type FROM information_schema.columns
+                WHERE table_name = %s;
+            """, (table_name,))
+            columns = cursor.fetchall()
+            for col in columns:
+                # col structure: (column_name, data_type)
+                schema_info += f"  - {col[0]} ({col[1]})\n"
+    print("Tables Found:", [t[0] for t in tables])
     return schema_info.strip()
 
 def get_table_schema(conn, table_name):
     """Retrieves the schema for a single table."""
-    cursor = conn.cursor()
     schema_info = f"Table: {table_name}\n"
-    cursor.execute(f"PRAGMA table_info({table_name});")
-    columns = cursor.fetchall()
-    for col in columns:
-        schema_info += f"  - {col[1]} ({col[2]})\n"
+    with conn.cursor() as cursor:
+        cursor.execute("""
+            SELECT column_name, data_type FROM information_schema.columns
+            WHERE table_name = %s;
+        """, (table_name,))
+        columns = cursor.fetchall()
+        for col in columns:
+            schema_info += f"  - {col[0]} ({col[1]})\n"
     return schema_info
 
 def get_table_schema_json(conn, table_name):
-    """Retrieves the schema for a single table."""
-    cursor = conn.cursor()
-    cursor.execute(f"PRAGMA table_info({table_name});")
-    columns = cursor.fetchall()
+    """Retrieves the schema for a single table in JSON format."""
     column_schemas = {}
-    for col in columns:
-        column_schemas[col[1]] = col[2]
+    with conn.cursor() as cursor:
+        cursor.execute("""
+            SELECT column_name, data_type FROM information_schema.columns
+            WHERE table_name = %s;
+        """, (table_name,))
+        columns = cursor.fetchall()
+        for col in columns:
+            # col[0] is column_name, col[1] is data_type
+            column_schemas[col[0]] = col[1]
     return column_schemas
 
 def execute_query(conn, query, params=None):
     """Executes a given SQL query."""
-    cursor = conn.cursor()
-    if params:
-        cursor.execute(query, params)
-    else:
-        cursor.execute(query)
+    with conn.cursor() as cursor:
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
     conn.commit()
 
 def print_table_data(conn, table_name):
     """Prints all rows from a specified table for verification."""
-    print(f"\n--- Current Data in '{table_name}' ---")
+    print(f"\n--- Current Data in '{table_name}' (first 5 rows) ---")
     try:
-        df = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 5", conn)
+        # Using f-string for table name is generally safe here as it's internally controlled
+        df = pd.read_sql_query(f'SELECT * FROM "{table_name}" LIMIT 5', conn)
         print(df.to_string())
     except Exception as e:
         print(f"Could not read from table '{table_name}': {e}")
-    print("------------------------------------\n")
+    print("------------------------------------------------------\n")
 
 
 # --- MARKDOWN & DATAFRAME FUNCTIONS ---
-import re
-import mdpd
-
 def parse_markdown_table(md_table_string):
     return mdpd.from_md(md_table_string)
 
-# --- LLM-POWERED LOGIC ---
+# --- LLM-POWERED LOGIC (UNCHANGED) ---
+# All the functions that interact with the LLM (e.g., get_matching_table_name,
+# generate_new_table_details, etc.) do not need to be changed as they are
+# database-agnostic. They operate on schema text and dataframes, not direct
+# DB connections. I'm omitting them here for brevity but you should keep them
+# in your script exactly as they were.
 
 def get_matching_table_name(schema, df_columns, df_sample_rows):
     """
     Uses an LLM to determine if the new data can fit into an existing table.
     """
-    print("\nStep 2: Asking LLM to find a matching table...")
+    print("\nStep 2: Asking LLM to find a matching table...", df_sample_rows)
     schema_description = str(schema) if schema else "The database is empty. There are no tables."
 
     prompt = ChatPromptTemplate.from_messages([
@@ -169,11 +205,6 @@ def parse_llm_json(llm_output_str):
         return json.loads(json_str)
     except json.JSONDecodeError:
         return None
-
-import json
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-# Assume 'llm' and 'parse_llm_json' are defined elsewhere
 
 def generate_new_table_details(df, intents, subdomain):
     """
@@ -336,144 +367,140 @@ Instructions:
     except (json.JSONDecodeError, KeyError) as e:
         print(f"Error parsing LLM response for column map: {e}")
         return None
+# --- END OF LLM-POWERED LOGIC ---
 
 def remove_backslash_except_backslash(text: str) -> str:
     return re.sub(r'\\([^\\])', r'\1', text)
 
+# --- CORE INGESTION LOGIC (MODIFIED FOR POSTGRESQL) ---
 
 def ingest_markdown_table(md_table: str, file_name: str, file_size: int, intents, brief_summary, subdomain, publishing_authority, conn = None) -> FileIngestionResult | TableDetails:
     
     print("=====================================================")
-    print("Starting new ingestion process...")
-    print("Input Markdown Table:")
+    print("Starting new ingestion process for PostgreSQL...")
     print("=====================================================")
 
     conn = get_db_connection()
-
     sql_commands = []
 
-    print("\nStep 1: Retrieving current database schema...")
-    schema = get_db_schema(conn)
-    if len(schema.strip()) == 0:
-        print("No existing tables found. Will create a new table.")
-    
     try:
-        df = run_normalization(remove_backslash_except_backslash(md_table))
-    except Exception as e:
-        print("Error occurred:", e)
-
-    file_selector_prompt = None
-    if df is None:
-        raise Exception("Normalization failed. Aborting.")
-    
-    target_table = get_matching_table_name(
-        schema=schema,
-        df_columns=df.columns.tolist(),
-        df_sample_rows=df.head(2)
-    )
-    
-    column_map = None
-
-    if target_table:
-        table_schema = get_table_schema(conn, target_table)
-        column_map = generate_existing_table_column_map(table_schema, df.columns.tolist())
-    else:
-        schema_details = generate_new_table_details(df, intents, subdomain)
-        if not schema_details:
-            print("Could not generate a valid new table schema. Aborting.")
-            conn.close()
-            raise Exception("LLM failed to generate a valid new table schema.")
-        if schema_details and 'table_name' in schema_details and 'columns' in schema_details:
-            target_table = schema_details['table_name']
-            column_map = schema_details['columns']
-            
-            cols_sql_parts = [f"\"{col['sql_col']}\" {col['sql_type']}" for col in column_map]
-            create_sql = f"CREATE TABLE IF NOT EXISTS {target_table} ({', '.join(cols_sql_parts)})"
-            sql_commands.append(create_sql)
-            
-            print(f"Executing CREATE TABLE statement: {create_sql}")
-            execute_query(conn, create_sql)
-            
-            file_selector_prompt = generate_file_selector_prompt(
-                table_name=target_table,
-                headers=df.columns.tolist(),
-                sample_rows=df.head(2).values.tolist(),
-                intents=intents,
-                brief_summary=brief_summary,
-                subdomain=subdomain,
-                publishing_authority=publishing_authority
-            )
-            print(f"Generated Prompt: {file_selector_prompt}")
-        else:
-            print("Could not generate a valid new table schema. Aborting.")
-            conn.close()
-            raise Exception("LLM response for new table schema was malformed.")
-
-    if target_table and column_map:
-        print(f"\nStep 4: Inserting data into '{target_table}' using explicit column map...")
-
-        sql_cols = [col['sql_col'] for col in column_map]
-        df_cols_ordered = [col['df_col'] for col in column_map]
-        df_for_insert = df[df_cols_ordered].copy()
-
-        # Get SQL schema for target table
-        table_schema = get_table_schema_json(conn, target_table)  # {col_name: sql_type}
+        print("\nStep 1: Retrieving current database schema...")
+        schema = get_db_schema(conn)
+        if len(schema.strip()) == 0:
+            print("No existing tables found. Will create a new table.")
         
-        # Function to check if value matches SQL type
-        def validate_value(value, sql_type):
-            if pd.isna(value) or value == "":
-                return None
-            try:
-                if "INT" in sql_type.upper():
-                    return int(value)
-                elif "REAL" in sql_type.upper() or "FLOAT" in sql_type.upper() or "DOUBLE" in sql_type.upper():
-                    return float(value)
-                elif "CHAR" in sql_type.upper() or "TEXT" in sql_type.upper() or "CLOB" in sql_type.upper():
-                    return str(value)
-                elif "DATE" in sql_type.upper():
-                    # Add date parsing logic if needed
-                    return str(value)
-                else:
-                    return value
-            except (ValueError, TypeError):
-                return None  # If conversion fails, set to NULL
+        try:
+            df = run_normalization(remove_backslash_except_backslash(md_table))
+        except Exception as e:
+            print("Error occurred during normalization:", e)
+            raise
 
-        # Validate and clean the dataframe before insert
-        for i, sql_col in enumerate(sql_cols):
-            sql_type = table_schema[sql_col]
-            df_for_insert.iloc[:, i] = df_for_insert.iloc[:, i].apply(lambda v: validate_value(v, sql_type))
-
-        columns_str = ', '.join(f'"{c}"' for c in sql_cols)
-        placeholders = ', '.join(['?'] * len(sql_cols))
-        insert_sql = f"INSERT INTO {target_table} ({columns_str}) VALUES ({placeholders})"
-        sql_commands.append(insert_sql)
-
-        rows_to_insert = [tuple(row) for row in df_for_insert.itertuples(index=False)]
-
-        cursor = conn.cursor()
-        cursor.executemany(insert_sql, rows_to_insert)
-        conn.commit()
-        print(f"✅ Successfully inserted {len(rows_to_insert)} rows.")
-
-        print_table_data(conn, target_table)
-
-        table_details = get_table_schema_json(conn, target_table)
-        conn.close()
-
-        schema_details_list = [
-            ColumnSchema(name=col['sql_col'], type=table_details[col['sql_col']]) 
-            for col in column_map
-        ]
-
-        return TableDetails(
-            tableName=target_table,
-            schema_details=schema_details_list,
-            rowsInserted=len(rows_to_insert),
-            sqlCommands=sql_commands,
-            fileSelectorPrompt=file_selector_prompt
+        file_selector_prompt = None
+        if df is None:
+            raise Exception("Normalization failed. Aborting.")
+        
+        target_table = get_matching_table_name(
+            schema=schema,
+            df_columns=df.columns.tolist(),
+            df_sample_rows=df.head(2)
         )
+        
+        column_map = None
 
-    else:
-        print("❌ Process failed. No target table or column map could be determined.")
-        conn.close()
-        raise Exception("Could not determine target table or column map.")
+        if target_table:
+            table_schema = get_table_schema(conn, target_table)
+            column_map = generate_existing_table_column_map(table_schema, df.columns.tolist())
+        else:
+            schema_details = generate_new_table_details(df, intents, subdomain)
+            if not schema_details:
+                raise Exception("LLM failed to generate a valid new table schema.")
+
+            if schema_details and 'table_name' in schema_details and 'columns' in schema_details:
+                target_table = schema_details['table_name']
+                column_map = schema_details['columns']
+                
+                cols_sql_parts = [f'"{col["sql_col"]}" {col["sql_type"]}' for col in column_map]
+                # Use double quotes for table name for case sensitivity and reserved words
+                create_sql = f'CREATE TABLE IF NOT EXISTS "{target_table}" ({", ".join(cols_sql_parts)})'
+                sql_commands.append(create_sql)
+                
+                print(f"Executing CREATE TABLE statement: {create_sql}")
+                execute_query(conn, create_sql)
+                
+                file_selector_prompt = generate_file_selector_prompt(
+                    table_name=target_table,
+                    headers=df.columns.tolist(),
+                    sample_rows=df.head(2).values.tolist(),
+                    intents=intents,
+                    brief_summary=brief_summary,
+                    subdomain=subdomain,
+                    publishing_authority=publishing_authority
+                )
+                print(f"Generated Prompt: {file_selector_prompt}")
+            else:
+                raise Exception("LLM response for new table schema was malformed.")
+
+        if target_table and column_map:
+            print(f"\nStep 4: Inserting data into '{target_table}' using explicit column map...")
+
+            sql_cols = [col['sql_col'] for col in column_map]
+            df_cols_ordered = [col['df_col'] for col in column_map]
+            df_for_insert = df[df_cols_ordered].copy()
+
+            table_schema_json = get_table_schema_json(conn, target_table)
+            
+            def validate_value(value, sql_type):
+                if pd.isna(value) or value == "":
+                    return None
+                try:
+                    sql_type_upper = sql_type.upper()
+                    if "INT" in sql_type_upper:
+                        return int(value)
+                    elif any(t in sql_type_upper for t in ["REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL"]):
+                        return float(value)
+                    else: # TEXT, VARCHAR, DATE, etc.
+                        return str(value)
+                except (ValueError, TypeError):
+                    return None # Set to NULL if conversion fails
+
+            for i, sql_col in enumerate(sql_cols):
+                sql_type = table_schema_json.get(sql_col, "TEXT") # Default to TEXT if not found
+                df_for_insert.iloc[:, i] = df_for_insert.iloc[:, i].apply(lambda v: validate_value(v, sql_type))
+
+            columns_str = ', '.join(f'"{c}"' for c in sql_cols)
+            # *** KEY CHANGE: Use %s for psycopg2 placeholders instead of ? ***
+            placeholders = ', '.join(['%s'] * len(sql_cols))
+            insert_sql = f'INSERT INTO "{target_table}" ({columns_str}) VALUES ({placeholders})'
+            sql_commands.append(insert_sql)
+
+            rows_to_insert = [tuple(row) for row in df_for_insert.itertuples(index=False)]
+
+            with conn.cursor() as cursor:
+                cursor.executemany(insert_sql, rows_to_insert)
+            conn.commit()
+            print(f"✅ Successfully inserted {len(rows_to_insert)} rows.")
+
+            print_table_data(conn, target_table)
+
+            table_details = get_table_schema_json(conn, target_table)
+            
+            schema_details_list = [
+                ColumnSchema(name=col['sql_col'], type=table_details.get(col['sql_col'], 'UNKNOWN')) 
+                for col in column_map
+            ]
+
+            return TableDetails(
+                tableName=target_table,
+                schema_details=schema_details_list,
+                rowsInserted=len(rows_to_insert),
+                sqlCommands=sql_commands,
+                fileSelectorPrompt=file_selector_prompt
+            )
+
+        else:
+            raise Exception("Could not determine target table or column map.")
+
+    finally:
+        if conn:
+            conn.close()
+            print("PostgreSQL connection closed.")
